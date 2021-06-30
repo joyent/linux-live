@@ -1,0 +1,77 @@
+#!/bin/bash
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+#
+# Copyright 2020 Joyent Inc.
+#
+
+#
+# LXD initial configuration.
+#
+export PATH=/bin:/usr/bin:/usr/sbin:/usr/node/bin:/usr/triton/bin
+
+set -o xtrace
+
+if [ "$(getent group lxd)" == "" ]; then
+    groupadd lxd
+fi
+
+echo "root:1000000:65536" | tee -a /etc/subuid /etc/subgid
+
+
+# Before we initialize lxd we need to check if zones/lxd exists, create if
+# needed and mount it as /var/lib/lxd.
+# If it already exists, we don't need to run lxd --init later.
+MOUNTPOINT=$(zfs get -H mountpoint -o value zones/lxd)
+UNINITIALIZED=$?
+if [ $UNINITIALIZED != 0 ]; then
+    /usr/sbin/zfs create -o mountpoint=/var/lib/lxd zones/lxd
+elif [ "${MOUNTPOINT}" != "/var/lib/lxd" ]; then
+    /usr/sbin/zfs set mountpoint=/var/lib/lxd zones/lxd
+fi
+
+export PATH="/usr/node/bin:/usr/triton/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/lxd/bin"
+export LD_LIBRARY_PATH="/usr/local/lxd/deps/sqlite/.libs/:/usr/local/lxd/deps/libco/:/usr/local/lxd/deps/dqlite/.libs/:/usr/local/lxd/deps/raft/.libs/:${LD_LIBRARY_PATH}"
+
+# Need to run lxd before we can configure it:
+/usr/local/lxd/bin/lxd --group=lxd &
+
+# Trap the LXD PID just in case we need to kill the process:
+LXDPID=$!
+# Wait for the LXD REST API to be ready before calling `init`
+/usr/local/lxd/bin/lxd waitready
+
+if [ $UNINITIALIZED != 0 ]; then
+    /usr/local/lxd/bin/lxd init --auto
+fi
+# Mountpoint will probably be "none", which is expected due to the way
+# lxc handles zfs datasets. We only need to create the dataset if we
+# get an error running the command.
+if ! zfs list -H -o mountpoint zones/lxdpool ; then
+    /usr/sbin/zfs create -o mountpoint=/zones/lxdpool zones/lxdpool
+    /usr/local/lxd/bin/lxc storage create lxdpool zfs source=zones/lxdpool
+
+    /usr/local/lxd/bin/lxc profile device remove default root
+    /usr/local/lxd/bin/lxc profile device add default root disk path=/ pool=lxdpool
+fi
+
+
+# Can safely comment out the next group of commands. These are just to
+# print some output expected to work
+echo "LXD init finished. Displaying default profile."
+/usr/local/lxd/bin/lxc profile show default
+echo "Querying LXD REST API."
+# This should list the default profile using the REST API:
+/usr/bin/curl -s --unix-socket /var/lib/lxd/unix.socket lxd/1.0/profiles/default|json
+
+# Next the triton-lxd.service will start lxd again
+echo "Exiting LXD project"
+/usr/local/lxd/bin/lxd shutdown
+
+# Just in case:
+kill -9 $LXDPID
+
+exit 0

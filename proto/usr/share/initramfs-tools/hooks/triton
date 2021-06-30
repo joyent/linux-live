@@ -1,0 +1,26 @@
+#!/bin/sh -e
+
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+
+#
+# Copyright 2020 Joyent, Inc.
+#
+
+if [ "$1" = "prereqs" ]; then
+	exit 0
+fi
+
+. /usr/share/initramfs-tools/hook-functions
+
+copy_exec /usr/sbin/dmidecode
+copy_exec /usr/triton/bin/sethostid /bin/sethostid
+# jq used by triton-networking
+copy_exec /usr/bin/jq
+# bc used by triton-networking
+copy_exec /usr/bin/bc
+# chpasswd used by triton-general
+copy_exec /usr/sbin/chpasswd

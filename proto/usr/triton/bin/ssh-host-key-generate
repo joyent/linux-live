@@ -1,0 +1,40 @@
+#! /bin/bash
+
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+
+#
+# Copyright 2020 Joyent, Inc.
+#
+
+export PATH=/bin:/usr/bin:/usr/sbin
+
+set -euo pipefail
+
+mapfile -t keyfiles < <(awk '$1 == "HostKey" {print $2}' /etc/ssh/sshd_config)
+
+for path in "${keyfiles[@]}"; do
+	if [[ -f $path ]]; then
+		continue
+	fi
+
+	file=$(basename "$path")
+
+	if ! [[ $file =~ ssh_host_.*_key ]]; then
+		echo "$0: unable to determine key type from $path" 1>&2
+		exit 1
+	fi
+	keytype=$(echo "$file" | sed -e 's/^ssh_host_//' -e 's/_key$//')
+
+	case $keytype in
+	rsa)	bits=(-b 4096) ;;
+	ecdsa)	bits=(-b 521) ;;
+	*)	bits=()
+	esac
+	ssh-keygen -t "$keytype" -P "" -f "$path" "${bits[@]}"
+done
+
+exit 0

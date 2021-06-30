@@ -1,0 +1,161 @@
+#!/bin/sh
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+
+#
+# Copyright 2021 Joyent, Inc.
+#
+
+#
+# This script is responsible for mounting file systems required by systemd from
+# the system zpool prior to starting systemd.
+#
+
+if [ "$1" = "prereqs" ]; then
+	exit 0
+fi
+
+# shellcheck disable=SC1091
+. /scripts/functions
+# shellcheck source=proto/usr/share/initramfs-tools/scripts/triton
+. /scripts/triton
+
+log_begin_msg "triton-syspool"
+
+is_syspool()
+{
+	p=$1
+	zfs mount "$p" || return 1
+
+	mp=$(zfs list -Ho mountpoint "$p")
+	if [ -f "$mp/.system_pool" ]; then
+		return 0
+	fi
+	zfs umount "$p"
+	return 1
+}
+
+# Set the hostid and load the zfs module even if noimport=true. We might
+# want to import the pool post-boot.
+sethostid
+modprobe zfs
+
+# Apparently with an initrd, sleep before pool import is just a normal thing
+# in the Linux world.
+# See /usr/share/initramfs-tools/scripts/zfs, specifically the
+# load_module_initrd() function and the behavior of the
+# ZFS_INITRD_PRE_MOUNTROOT_SLEEP and ZFS_INITRD_POST_MODPROBE_SLEEP variables.
+#
+# Some hardware consistently hasn't yet enumerated devices by the time we go
+# about importing the pool. Normally you'd figure out if this applies to you
+# and set these options in /etc/defaults/zfs. Because the only persistent
+# storage we have is on the zpool, we can't do that. Unfortunately, we have to
+# subject everybody to this. We can't even check to see if the devices are
+# present because maybe some but not all are. Maybe all devices for a
+# non-system pool are present, but none for the system pool are present.
+# We just can't know if it's ready for us.
+#
+# Here, we're going to check the value in /etc/defaults/zfs (which is on the
+# platform image, and we don't set by default so the value shouldn't be present)
+# then allow that value to be overriden by the kernel command line. This is a
+# deviation from the standard ZoL behavior, but it will allow Triton users to
+# override this value via cnapi for problematic hardware. Finally, if it's not
+# present in either /etc/defaults/zfs or /proc/cmdline we'll fall back to a
+# value that in our experience seems to work for most cases.
+if [ -f /etc/defaults/zfs ]; then
+	if grep -q -w ZFS_INITRD_POST_MODPROBE_SLEEP /etc/defaults/zfs; then
+		# shellcheck disable=SC1091
+		. /etc/defaults/zfs
+		#shellcheck disable=SC2154
+		zfs_modprobe_sleep=$ZFS_INITRD_POST_MODPROBE_SLEEP
+	fi
+fi
+eval "$(tr ' ' '\n' < /proc/cmdline | grep -q -w zfs_modprobe_sleep)"
+sleep "${zfs_modprobe_sleep:=10}"
+
+# Handle noimport
+if grep -q -w noimport=true /proc/cmdline ; then
+	log_success_mgs "Not importing zpools due to noimport on the kernel command line"
+	log_end_msg
+	exit 0
+fi
+
+# If noimport was not set, then we continue on.
+zpool import -aN
+
+syspool=
+for pool in $(zfs list -Ho name -d0); do
+	if is_syspool "$pool"; then
+		syspool=$pool
+		log_success_msg "System pool is ${syspool}"
+		mkdir -p /run/triton || true
+		ln -s "/${syspool}/" /run/triton/system_pool
+		break
+	fi
+done
+
+# Handle factoryreset
+if grep -q -w 'destroy_zpools=true' /proc/cmdline ; then
+	log_warning_msg 'destroy_pools kernel command detected.'
+	destroy_zpools=1
+fi
+reset=$(zfs get -H -o value smartdc:factoryreset "${syspool}/var")
+if [ "${reset}" = "yes" ]; then
+	log_warning_msg "${syspool}/var dataset has factoryrest property."
+	destroy_zpools=1
+fi
+
+if [ -n "${destroy_zpools}" ]; then
+	destroy_out=$(zpool destroy "$syspool" 2>&1)
+	destroy_retval=$?
+	if [ $destroy_retval -gt 0 ] ; then
+		log_success_msg "zpool destroy succeeded"
+		log_success_msg "$(zpool list)"
+	else
+		log_failure_msg "zpool destroy failed with code $destroy_retval: $destroy_out"
+	fi
+	log_end_msg
+	exit 0
+fi
+
+# Mount all available zfs filesystems in the system zpool.
+if [ -n "$syspool" ]; then
+	# Ok, what are we doing here? I'm glad you asked.
+	# First of all, lxc will manage the storage pool on its own, so just
+	# skip it.
+	# Second, zones/lxd is listed before zones/var, so we need to sort
+	# by the mountpoint to ensure that /var gets mounted before
+	# /var/lib/lxd.
+	# And finally we force this to evaluate with a success exit code
+	# so the script doesn't abort if there's no pool It doesn't *really*
+	# matter because this is the end of the script, but we want to ensure
+	# that log_end_msg gets emitted.
+	(zfs list -Ho canmount,name,mountpoint -p -r "$syspool" | \
+		grep -v lxdpool | sort -k 3 || true) | \
+	while IFS="$(printf '\t')" read -r canmount name mountpoint; do
+		# Skip datasets not marked mountable
+		if ! [ "$canmount" = on ]; then
+			continue
+		fi
+		# legacy means it will get mounted from /etc/fstab
+		# none means it should not be mounted
+		# Skip those as well
+		if [ "$mountpoint" = "legacy" ] || [ "$mountpoint" = "none" ]; then
+			continue
+		fi
+		mp="$rootmnt/$mountpoint"
+		# Normally this is unnecessary, but with non-persistent root
+		# on a ramdisk the mountpoint may be set to a directory that
+		# did exist at one time but isn't part of the platform iamge.
+		mkdir -p "$mp"
+		echo "Triton mounting zfs dataset $name on $mp"
+		mount -o zfsutil -t zfs "$name" "$mp"
+	done
+fi
+
+log_end_msg
+
+exit 0

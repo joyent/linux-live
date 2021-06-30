@@ -1,0 +1,1114 @@
+#! /bin/bash
+
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+
+#
+# Copyright 2021 Joyent, Inc.
+#
+
+#
+# This is an initial crude hack that generates a debian-live image that includes
+# ZFS.  Thanks to https://willhaley.com/blog/custom-debian-live-environment/ for
+# making this problem easily approachable.
+#
+
+export PATH=/bin:/usr/bin:/usr/sbin
+
+PS4='${FUNCNAME:-debian-live}: '
+set -euo pipefail
+set -o xtrace
+
+# Unset some environment variables that can mess with chroot npm install.
+unset SUDO_COMMAND
+unset SUDO_GID
+unset SUDO_UID
+unset SUDO_USER
+
+# Detect rust, if it's a user install
+if [[ -f ~/.cargo/env ]]; then
+	# shellcheck disable=SC1090
+	source ~/.cargo/env
+fi
+
+debver=buster
+name="Debian 10"
+docurl=https://github.com/joyent/linux-live
+
+golang_ver=1.15.6
+rust_version=1.5.2
+
+kernel_version=5.10.0-0.bpo.5
+lxd_ver=4.0.4
+zfs_ver=2.0.3
+
+# From https://willhaley.com/blog/custom-debian-live-environment/
+packages=(live-boot systemd-sysv)
+packages+=(net-tools openssh-client rsync)
+
+# For systemd-nspawn
+packages+=(systemd-container)
+
+# For set-hostid, sysinfo, etc.
+packages+=(dmidecode python3)
+
+# Additional packages for a useful system.
+packages+=(
+    bc
+    bpftrace
+    bpfcc-tools
+    ca-certificates
+    curl
+    dnsutils
+    extrace
+    ipmitool
+    iproute2
+    iputils-ping
+    jq
+    less
+    lldpd
+    lshw
+    lsof
+    man
+    netcat-openbsd
+    ntpdate
+    openssh-server
+    psmisc
+    rsync
+    screen
+    socat
+    strace
+    sudo
+    sysstat
+    vim
+)
+
+# Agents build relies on uuid.
+packages+=(uuid)
+
+# NodeJS
+packages+=(nodejs)
+
+# required by lxd:
+packages+=(iptables apparmor apparmor-profiles apparmor-utils liblxc1 lxc acl autoconf
+    dnsmasq-base git libtool rsync pkg-config make tar tcl libuv1 squashfs-tools
+    xz-utils ebtables lvm2 thin-provisioning-tools btrfs-tools
+)
+
+# These packages are here to aid in building the image - they are installed
+# temporarily, then later removed.
+temp_build_packages=(gawk alien libblkid-dev uuid-dev libudev-dev libssl-dev
+    zlib1g-dev libaio-dev libattr1-dev libelf-dev python python3-setuptools
+    python3-cffi libffi-dev build-essential gdebi dpkg-dev fakeroot debhelper
+    dkms python3-dev
+)
+
+# packages required to build lxd
+temp_build_packages+=(libacl1-dev libcap-dev lxc-dev libuv1-dev patchelf)
+
+# These are for the lxd test suite:
+temp_build_packages+=(libapparmor-dev libseccomp-dev libcap-dev gettext
+    uuid-runtime bzr socat libsqlite3-dev
+)
+
+# Args added to 'apt install'
+apt_args=(-y)
+apt_args+=(--no-install-recommends)
+
+#
+# No more configuration
+#
+
+clean=()
+function cleanup {
+	local i=${#clean[@]}
+
+	while (( i > 0 )); do
+		(( i-- ))
+		eval "${clean[i]}"
+	done
+
+	if [[ $clean_exit != true ]]; then
+		echo "ERROR: Build failed"
+		echo "Build release: $release"
+		echo "Build directory: $top"
+	fi
+}
+trap cleanup EXIT
+
+clean_exit=false
+function onfatal {
+	if [[ $clean_exit == false ]]; then
+		echo "Cleaning up: $*" 1>&2
+		eval "$@"
+	fi
+}
+
+function unmount_children {
+	local dirs
+	mapfile -t dirs < <(mount | awk -v root="$root/" '
+	BEGIN {
+		if ( root == "/" || root == "" ) {
+			printf "cleanup: root is \"%s\"\n", root >/dev/fd/2
+			exit 1
+		}
+	}
+	$3 ~ root {
+		print $3
+	}' | sort -r)
+	for dir in "${dirs[@]}"; do
+		umount "$dir"
+	done
+}
+
+# Ensure we have all the commands that will be needed
+function preflight_check {
+	local packages=(
+		build-essential		# to build src/sethostid
+		curl			# called by this script
+		debootstrap		# called by this script
+		dosfstools		# mkfs.vfat called by this script
+		gdisk			# called by this script
+		git			# called by this script
+		grub-efi		# called by this script
+		grub-pc-bin		# for grub-mkstandalone
+		kpartx			# called by this script
+		zlib1g-dev		# to build src/sethostid
+		mtools			# mcopy called by this script
+		parted			# called by this script
+		pigz			# called by this script
+		squashfs-tools		# mksquashfs called by this script
+		xorriso			# called by this script
+		pwgen			# called by this script
+	)
+
+	local missing=() status
+	local missing_rust=true
+	for pkg in "${packages[@]}"; do
+		status=$(dpkg-query -W -f '${db:Status-Status}' "$pkg" \
+		    2>/dev/null || true)
+		if [[ $status != installed ]]; then
+			missing+=( "$pkg" )
+		fi
+	done
+	if command -v rustc && command -v cargo ; then
+		missing_rust=false
+	fi
+	if (( ${#missing[@]} == 0 )) && [[ "$missing_rust" == "false" ]]; then
+		return 0
+	fi
+	if [[ $install_missing == true ]]; then
+		apt update
+		apt install -y "${missing[@]}"
+		if [[ $missing_rust == "true" ]]; then
+			curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+				sh -s -- -q -y --profile minimal \
+				--default-host x86_64-unknown-linux-gnu \
+				--default-toolchain "$rust_version"
+		fi
+		return 0
+	fi
+
+	exec 1>&2
+	echo "$0: Missing ${#missing[@]} packages."
+	echo ""
+	echo "To fix, run:"
+	echo "    apt install -y ${missing[*]}"
+	echo "Then:"
+	echo "    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain $rust_version"
+	exit 1
+}
+
+function create_bootstrap {
+	debootstrap --arch=amd64 --variant=minbase "$debver" "$root" \
+	    http://ftp.us.debian.org/debian/
+}
+
+function install_live {
+	chroot "$root" tee /etc/apt/sources.list >/dev/null <<-EOF
+	deb http://deb.debian.org/debian/ $debver main
+	deb-src http://deb.debian.org/debian/ $debver main
+
+	deb http://security.debian.org/debian-security $debver/updates main
+	deb-src http://security.debian.org/debian-security $debver/updates main
+
+	deb http://deb.debian.org/debian/ $debver-updates main
+	deb-src http://deb.debian.org/debian/ $debver-updates main
+	EOF
+
+	chroot "$root" tee /etc/apt/sources.list.d/$debver-backports.list \
+	    >/dev/null <<-EOF
+	# https://github.com/zfsonlinux/zfs/wiki/Debian#installation
+	deb http://deb.debian.org/debian $debver-backports main contrib
+	deb-src http://deb.debian.org/debian $debver-backports main contrib
+	EOF
+
+	chroot "$root" tee /etc/apt/preferences.d/90_zfs >/dev/null <<-EOF
+	# https://github.com/zfsonlinux/zfs/wiki/Debian#installation
+	Package: libnvpair1linux libuutil1linux libzfs2linux libzpool2linux spl-dkms zfs-dkms zfs-test zfsutils-linux zfsutils-linux-dev zfs-zed
+	Pin: release n=buster-backports
+	Pin-Priority: 990
+	EOF
+
+	curl -sL https://deb.nodesource.com/setup_14.x | chroot "$root" bash -
+	chroot "$root" apt update
+}
+
+# Install more recent kernel
+function install_kernel_packages {
+	# This installs the new kernel
+	chroot "$root" env DEBIAN_FRONTEND=noninteractive apt install \
+	    "${apt_args[@]}" \
+	    "linux-image-${kernel_version}-amd64" \
+	    "linux-headers-${kernel_version}-amd64"
+
+	# This removes the old kernel
+	chroot "$root" env DEBIAN_FRONTEND=noninteractive apt-get remove \
+	    "linux-image-4*" "linux-headers-4*" "linux-kbuild-4*"
+}
+
+# Install system packages.
+function install_packages {
+	chroot "$root" env DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade \
+	    "${apt_args[@]}"
+	chroot "$root" env DEBIAN_FRONTEND=noninteractive apt install \
+	    "${apt_args[@]}" "${packages[@]}"
+}
+
+# Install temporary packages.
+function install_temporary_packages {
+	chroot "$root" env DEBIAN_FRONTEND=noninteractive apt install \
+	    "${apt_args[@]}" "${temp_build_packages[@]}"
+}
+
+# Build ZFS. Ideally this (and other build steps in this script, e.g. lxd) would
+# be done separately and packages generated that we install via apt like
+# everything else. Once we have Linux as a platform it should be easier to run
+# things like a build farm and repo.
+function build_zfs {
+	# shellcheck disable=1004 disable=2016
+	chroot "$root" env zfs_ver=$zfs_ver bash -c '
+	    PS4="BUILD_ZFS: "
+	    set -xeuo pipefail
+
+	    export DEBIAN_FRONTEND=noninteractive
+	    export LC_ALL=C
+
+	    rm -rf zfs
+	    git clone -b zfs-$zfs_ver https://github.com/zfsonlinux/zfs.git
+	    cd zfs
+	    ./autogen.sh
+	    ./configure --with-linux=$(echo /usr/src/linux-headers-*-common) \
+	        --with-linux-obj=$(echo /usr/src/linux-headers-*-amd64) \
+	'
+
+	clean+=(unmount_children)
+	mount -t proc proc "$root/proc"
+	# shellcheck disable=2016
+	chroot "$root" bash -c '
+	    PS4="BUILD_ZFS: "
+	    set -xeuo pipefail
+
+	    cd zfs
+	    make -j1 pkg-utils deb-kmod
+	    tar cvf /all-packages.tar *.deb
+	    rm kmod-zfs-devel*.deb zfs-test*.deb
+	    tar cvf /packages.tar *.deb
+	    for file in *.deb; do gdebi -q --non-interactive $file; done
+	    cd ..
+	    rm -rf zfs
+	'
+	umount "$root/proc"
+
+	mv "$root/all-packages.tar" "$root/packages.tar" "$scratch"
+
+}
+
+# In the previous "apt install" we built the ZFS kernel modules and installed
+# additional packages (over 100 MiB of development tools), so now cleanup
+# (remove) the packages which are no longer needed.
+function remove_temporary_packages {
+	# shellcheck disable=2016
+	chroot "$root" env zfs_ver="$zfs_ver" pkgs="${temp_build_packages[*]}" \
+	    bash -c '
+		PS4="CLEAN_ZFS_DEV: "
+		set -xeuo pipefail
+
+		export DEBIAN_FRONTEND=noninteractive
+		export LC_ALL=C
+
+		apt remove -y $pkgs "kernel-headers-*"
+		apt-get autoremove -y
+
+		rm -f /tmp/zfs-modules-*.deb
+	'
+}
+
+# As much as possible, bits that are needed to support Triton will appear in
+# /usr/triton.
+function install_usr_triton {
+	chroot "$root" mkdir -p /usr/triton/bin
+	chroot "$root" mkdir -p /usr/triton/defaults/agents
+	chroot "$root" bash -c '
+	    PS4="INSTALL_USR_TRITON: "
+	    set -xeuo pipefail
+	    export LC_ALL=C
+
+	    # Install common node modules.
+	    npm install --production -g manta json bunyan assert-plus
+
+	    # Symlink lib/node to ensure global node_modules is on the require path.
+	    # XXX - why is this node_modules not already on the nodejs require path?
+	    # This is a long explanation. Can do some reading on node docs for details:
+	    # https://nodejs.org/api/modules.html#modules_loading_from_the_global_folders
+	    # Note we should be doing this instead where a global module is required:
+	    # export NODE_PATH=/usr/lib/node_modules
+	    cd /usr/lib && ln -s node_modules node
+
+	    # A lot of triton node scripts use modules from /usr/node/node_modules,
+	    # so we keep that compatability (for mkzpool, disklayout and friends).
+	    mkdir -p /usr/node/bin
+	    ln -sf /usr/lib/node /usr/node/node_modules
+	    ln -sf /usr/bin/node /usr/node/bin/node
+	'
+}
+
+# Install node scripts/modules that will be used by sdc-server setup:
+#  node_modules:
+#   - joyent/node-getopt
+#   - joyent/node-zfs
+#  scripts:
+#   - disklayout
+#   - mkzpool
+function install_usr_triton_helper_scripts {
+	# shellcheck disable=1004 disable=2016
+	chroot "$root" bash -c '
+	    PS4="INSTALL_USR_TRITON_HELPER_SCRIPTS: "
+	    set -xeuo pipefail
+	    export LC_ALL=C
+	    export PATH=/usr/node/bin:$PATH
+
+	    # node-getopt
+	    git -C /usr/triton clone https://github.com/joyent/node-getopt
+	    mv /usr/triton/node-getopt/lib/getopt.js \
+		/usr/lib/node_modules/
+	    rm -rf /usr/triton/node-getopt
+
+	    # node-zfs
+	    # Note: required for disklayout, mkzpool.
+	    git -C /usr/triton clone -b linuxcn https://github.com/joyent/node-zfs
+	    mv /usr/triton/node-zfs/lib/*.js \
+		/usr/lib/node_modules/
+	    rm -rf /usr/triton/node-zfs
+
+	    # disklayout
+	    curl -sSL https://raw.githubusercontent.com/joyent/smartos-live/linuxcn/src/disklayout.js > \
+		/usr/triton/bin/disklayout
+	    chmod 700 /usr/triton/bin/disklayout
+
+	    # mkzpool
+	    curl -sSL https://raw.githubusercontent.com/joyent/smartos-live/linuxcn/src/mkzpool.js > \
+                /usr/triton/bin/mkzpool
+	    chmod 700 /usr/triton/bin/mkzpool
+	'
+}
+
+# Install ur-agent and the dependencies (nice to have a build of this).
+function install_usr_triton_ur_agent {
+	chroot "$root" bash -c '
+	    PS4="INSTALL_USR_TRITON_UR_AGENT: "
+	    set -xeuo pipefail
+	    export LC_ALL=C
+
+	    git -C /usr/triton/defaults/agents clone -b linuxcn https://github.com/joyent/sdc-ur-agent ur-agent
+	    # Install a fake image_uuid (remove when we have a proper build).
+	    uuid -v4 > /usr/triton/defaults/agents/ur-agent/image_uuid
+	'
+}
+
+# Install cn-agent and the dependencies (nice to have a build of this).
+function install_usr_triton_cn_agent {
+	chroot "$root" bash -c '
+	    PS4="INSTALL_USR_TRITON_CN_AGENT: "
+	    set -xeuo pipefail
+	    export LC_ALL=C
+
+	    git -C /usr/triton/defaults/agents clone -b linuxcn https://github.com/joyent/sdc-cn-agent cn-agent
+	    cd /usr/triton/defaults/agents/cn-agent
+	    rm -f package-lock.json
+	    npm install --production --ignore-scripts
+	    # Install a fake image_uuid (remove when we have a proper build).
+	    uuid -v4 > image_uuid
+	'
+}
+
+# Install imgadm and the dependencies (nice to have a build of this).
+function install_usr_triton_imgadm {
+	chroot "$root" bash -c '
+        PS4="INSTALL_USR_TRITON_IMGADM: "
+        set -xeuo pipefail
+        export LC_ALL=C
+
+        git -C /usr/triton/defaults clone -b linuxcn https://github.com/joyent/node-imgadm imgadm
+        cd /usr/triton/defaults/imgadm
+        npm install --production
+        # Install a fake image_uuid (remove when we have a proper build).
+        uuid -v4 > image_uuid
+
+        # Make imgadm accessible.
+		# TODO: This should move to an persistent location (/opt/...)
+        ln -s /usr/triton/defaults/imgadm/sbin/imgadm /usr/triton/bin/imgadm
+	'
+}
+
+
+# Install config-agent and the dependencies (nice to have a build of this).
+function install_usr_triton_config_agent {
+	# git -C $scratch clone -b linuxcn https://github.com/joyent/sdc-config-agent
+	# cd $scratch/sdc-config-agent && npm install
+	# cp -rp $scratch/sdc-config-agent $root/usr/triton/
+
+	chroot "$root" bash -c '
+	    PS4="INSTALL_USR_TRITON_CONFIG_AGENT: "
+	    set -xeuo pipefail
+	    export LC_ALL=C
+
+	    git -C /usr/triton/defaults/agents clone -b linuxcn https://github.com/joyent/sdc-config-agent config-agent
+	    cd /usr/triton/defaults/agents/config-agent
+	    rm -f package-lock.json
+	    npm install --production --ignore-scripts
+	    # Install a fake image_uuid (remove when we have a proper build).
+	    uuid -v4 > image_uuid
+	'
+}
+
+
+# Install net-agent and the dependencies (nice to have a build of this).
+function install_usr_triton_net_agent {
+	# git -C $scratch clone -b linuxcn https://github.com/joyent/sdc-net-agent
+	# cd $scratch/sdc-net-agent && npm install
+	# cp -rp $scratch/sdc-net-agent $root/usr/triton/
+
+	chroot "$root" bash -c '
+	    PS4="INSTALL_USR_TRITON_NET_AGENT: "
+	    set -xeuo pipefail
+	    export LC_ALL=C
+
+	    git -C /usr/triton/defaults/agents clone -b linuxcn https://github.com/joyent/sdc-net-agent net-agent
+	    cd /usr/triton/defaults/agents/net-agent
+	    rm -f package-lock.json
+	    npm install --production --ignore-scripts
+	    # Install a fake image_uuid (remove when we have a proper build).
+	    uuid -v4 > image_uuid
+	'
+}
+
+
+# Install vm-agent and the dependencies (nice to have a build of this).
+function install_usr_triton_vm_agent {
+	chroot "$root" bash -c '
+        PS4="INSTALL_USR_TRITON_VM_AGENT: "
+        set -xeuo pipefail
+        export LC_ALL=C
+
+        git -C /usr/triton/defaults/agents clone -b linuxcn https://github.com/joyent/sdc-vm-agent vm-agent
+        cd /usr/triton/defaults/agents/vm-agent
+        npm install --production
+        # Install a fake image_uuid (remove when we have a proper build).
+        uuid -v4 > image_uuid
+	'
+}
+
+
+# Install metadata agent and the dependencies (nice to have a build of this).
+function install_usr_triton_metadata {
+	chroot "$root" bash -c '
+        PS4="INSTALL_USR_TRITON_METADATA: "
+        set -xeuo pipefail
+        export LC_ALL=C
+
+        git -C /usr/triton/defaults/agents clone -b linuxcn https://github.com/joyent/triton-metadata metadata-agent
+        cd /usr/triton/defaults/agents/metadata-agent
+        npm install --production
+		# Install a fake image_uuid (remove when we have a proper build).
+		uuid -v4 > image_uuid
+	'
+}
+
+
+# Install vminfod and the dependencies (nice to have a build of this).
+function install_usr_triton_vminfod {
+	chroot "$root" bash -c '
+        PS4="INSTALL_USR_TRITON_VMINFOD: "
+        set -xeuo pipefail
+        export LC_ALL=C
+
+        git -C /usr/triton/defaults/agents clone -b linuxcn https://github.com/joyent/triton-vminfod vminfod-agent
+        cd /usr/triton/defaults/agents/vminfod-agent
+        npm install --production
+		# Install a fake image_uuid (remove when we have a proper build).
+		uuid -v4 > image_uuid
+	'
+}
+
+
+function install_proto {
+	(cd "$repo/src" && make install)
+
+	# cpio is used for creating the archive because it will take a list of
+	# files from stdin.  tar is used for extracting it because it will
+	# create any required directories automatically.  The directories are
+	# not included because we don't want to accidentally change the
+	# permissions on directories that already exist.
+	#
+	# XXX consider transitioning to use of a manifest and install(1) for
+	# better control.
+	(cd "$repo/proto" && find . -type d -o -print | cpio -o -H ustar) |
+	    (chroot "$root" /usr/bin/tar --no-same-owner -xvf -)
+
+	# Enable all services that were installed.
+	# shellcheck disable=2016
+	chroot "$root" bash -c '
+	    PS4="INSTALL_PROTO: "
+	    set -xeuo pipefail
+	    export LC_ALL=C
+
+	    services=$(find /usr/lib/systemd -type f -name triton-\*.service |
+		awk -F/ "{print \$NF}")
+	    [[ -z $services ]] && exit 0
+
+	    systemctl enable $services
+
+	    # Symlink common SmartOS locations
+	    if [ -f /usr/triton/bin/sysinfo ]; then
+		ln -s /usr/triton/bin/sysinfo /usr/bin/sysinfo
+	    fi
+	'
+
+}
+
+# Build and install LXC/LXD. Like ZFS, eventually this should be done
+# separtely and artifacts dropped into a repo so that we can install vi apt.
+function install_lxd {
+	curl -L https://golang.org/dl/go${golang_ver}.linux-amd64.tar.gz |
+	    chroot "$root" tar -C /usr/local --no-same-owner -xzf -
+	LXD_RELEASE=lxd-$lxd_ver
+	curl -L https://github.com/lxc/lxd/releases/download/$LXD_RELEASE/$LXD_RELEASE.tar.gz |
+	    chroot "$root" tar -C /tmp --no-same-owner -xzf -
+	# shellcheck disable=2016
+	chroot "$root" env lxd_ver=$lxd_ver bash -c '
+	    PS4="BUILD_LXD: "
+	    set -xeuo pipefail
+
+	    export DEBIAN_FRONTEND=noninteractive
+	    export LC_ALL=C
+	    export LXD_RELEASE=/tmp/lxd-$lxd_ver
+	    export PATH=$PATH:/usr/local/go/bin
+
+	    cd $LXD_RELEASE
+	    export GOPATH=$(pwd)/_dist
+	    mkdir -p $GOPATH/bin
+	    export GOBIN=$GOPATH/bin
+
+	    make deps
+	    export CGO_CFLAGS="-I${GOPATH}/deps/sqlite/ -I${GOPATH}/deps/libco/ -I${GOPATH}/deps/raft/include/ -I${GOPATH}/deps/dqlite/include/"
+	    export CGO_LDFLAGS="-L${GOPATH}/deps/sqlite/.libs/ -L${GOPATH}/deps/libco/ -L${GOPATH}/deps/raft/.libs -L${GOPATH}/deps/dqlite/.libs/"
+	    export LD_LIBRARY_PATH="${GOPATH}/deps/sqlite/.libs/:${GOPATH}/deps/libco/:${GOPATH}/deps/raft/.libs/:${GOPATH}/deps/dqlite/.libs/"
+	    export CGO_LDFLAGS_ALLOW="-Wl,-wrap,pthread_create"
+
+	    make
+	    mv $(pwd)/_dist /usr/local/lxd
+
+	    # Add dynamic libraries to the lxd binary rpath.
+	    patchelf --set-rpath "\$ORIGIN/../deps/raft/.libs:\$ORIGIN/../deps/dqlite/.libs" /usr/local/lxd/bin/lxd
+
+	    rm -Rf /usr/local/go
+	'
+}
+
+function postinstall {
+	# Heavily inspired by mi-debian-hvm/debian-10/late-command
+	# shellcheck disable=1004 disable=2016
+	chroot "$root" env release="$release" motd="$motd" product="$product" \
+	    relase="$release" \
+	    bash -c '
+		PS4="POSTINSTALL: "
+		set -xeuo pipefail
+
+		echo debian-live-$release >/etc/hostname
+		echo "TRITON_RELEASE=\"$release\"" >> /etc/os-release
+
+		apt-get autoremove --purge -y
+		apt-get clean
+
+		rm -rf /var/lib/apt/lists/*
+		rm -rf /var/cache/*
+		rm -f /etc/machine-id /etc/hostid
+
+		passwd -d root
+
+		# For crazy quoting reasons we rely on $motd and $product from
+		# env
+		echo "$motd" >/etc/motd
+		ln -sf /etc/motd /etc/issue
+		ln -sf /etc/motd /etc/issue.net
+		echo "$product" >/etc/product
+
+		find /etc/ssh -name "ssh_host_*key*" -exec rm -f "{}" ";"
+		sed -i \
+		    -e "s,^#HostKey /etc/ssh/,HostKey /usr/triton/config/ssh/," \
+		    -e "s,^#\(PermitRootLogin prohibit-password\),PermitRootLogin yes," \
+		    /etc/ssh/sshd_config
+
+		rm -f /*.old
+
+		sed -i -e "s/^#DNSSEC=.*/DNSSEC=false/" /etc/systemd/resolved.conf
+
+		# The root home directory has nothing useful in it. Removing it
+		# makes it possible to have a dataset mounted on /root, thereby
+		# easily preserving SSH authorized_keys and such.
+		rm -rf /root
+		mkdir -m 700 /root
+
+		# As above, clean cruft here.
+		rm -f /etc/sudoers.d/*
+
+		# Make sure cores are stashed safely
+		echo "kernel.core_pattern = /zones/global/cores/core.%e.%p" > /etc/sysctl.conf
+
+		depmod -a $(basename /lib/modules/*)
+		update-initramfs -u
+	    '
+}
+
+function prepare_archive_bits {
+	mkdir -p "$image/live"
+	mksquashfs "$root" "$image/live/filesystem.squashfs" -noappend -e boot
+	cp "$root/vmlinuz" "$image/vmlinuz"
+	cp "$root/initrd.img" "$image/initrd"
+
+	cat <<EOF >"$scratch/grub.cfg"
+search --set=root --file /JOYENT_DEBIAN_LIVE
+
+insmod all_video
+
+set default="0"
+set timeout=30
+
+serial --speed=115200 --unit=1 --word=8 --parity=no --stop=1
+terminal_input --append serial
+terminal_output --append serial
+
+menuentry "Joyent Debian Live $release without DHCP ttyS0" {
+    linux /vmlinuz boot=live console=tty0 console=ttyS1
+    initrd /initrd
+}
+
+menuentry "Joyent Debian Live $release with default networking" {
+    linux /vmlinuz boot=live console=tty0 console=ttyS1 triton.dhcp-all-nics
+    initrd /initrd
+}
+
+menuentry "Joyent Debian Live $release without DHCP" {
+    linux /vmlinuz boot=live
+    initrd /initrd
+}
+EOF
+	echo "$release" > "$image/JOYENT_DEBIAN_LIVE"
+}
+
+function create_tgz {
+	local dir=$scratch/platform-$release
+
+	mkdir -p "$dir/etc/version"
+	echo "$release" > "$dir/etc/version/platform"
+	cp "$root/etc/os-release" "$dir/etc/version/os-release"
+	cat > "$dir/etc/version/gitstatus" <<EOF
+[
+    {
+        "repo": "linux-live",
+        "branch": "$(git branch | grep "^* " | cut -d ' ' -f2-)",
+        "commit_date": "$(git log -n 1 --pretty=format:%ct HEAD)",
+        "rev": "$(git rev-parse HEAD)",
+        "upstream_master_commit": "$(git rev-parse origin/master)",
+        "url": "$(git config remote.origin.url)"
+    }
+]
+EOF
+	# When debugging problems it can be handy to know what is changed that
+	# has not be committed to the upstream master branch.
+	mkdir -p "$dir/etc/patches"
+	git format-patch -o "$dir/etc/patches" origin/master
+	local out
+	out=$(git diff HEAD)
+	[[ -n "$out" ]] && echo "$out" > "$dir/etc/patches/9999-uncommitted"
+	out=$(git status 2>&1)
+	[[ -n "$out" ]] && echo "$out" > "$dir/etc/patches/git-status"
+
+	local dir_m
+	dir_m="$dir/$(uname -m)"
+	mkdir -p "$dir_m"
+	cp "$root/vmlinuz" "$dir_m/vmlinuz"
+	cp "$root/initrd.img" "$dir_m/initrd"
+	cp "$image/live/filesystem.squashfs" "$dir_m/filesystem.squashfs"
+
+	(cd "$scratch" &&
+	    tar cf - "platform-$release" | pigz > "$top/platform-$release.tgz")
+	ln -f -s "${top}/platform-$release.tgz" "$top/../platform-latest.tgz"
+
+}
+
+function create_iso {
+	grub-mkstandalone --format=x86_64-efi --output="$scratch/bootx64.efi" \
+	    --locales="" --fonts="" "boot/grub/grub.cfg=$scratch/grub.cfg"
+
+	grub-mkstandalone --format=i386-pc --output="$scratch/core.img" \
+	    --install-modules="linux normal iso9660 biosdisk serial memdisk search tar ls" \
+	    --modules="linux normal iso9660 biosdisk serial search" --locales="" \
+	    --fonts="" "boot/grub/grub.cfg=$scratch/grub.cfg"
+
+	# mcopy, mmd from mtools - Not Manta!
+	(cd "$scratch" && \
+	    dd if=/dev/zero of=efiboot.img bs=1M count=10 && \
+	    mkfs.vfat efiboot.img && \
+	    mmd -i efiboot.img efi efi/boot && \
+	    mcopy -i efiboot.img ./bootx64.efi ::efi/boot/
+	)
+
+	cat /usr/lib/grub/i386-pc/cdboot.img "$scratch/core.img" > \
+	    "$scratch/bios.img"
+
+	xorriso -as mkisofs -iso-level 3 -full-iso9660-filenames \
+	    -volid "JOYENT_DEBIAN_LIVE" -eltorito-boot boot/grub/bios.img \
+	    -no-emul-boot -boot-load-size 4 -boot-info-table \
+	    --eltorito-catalog boot/grub/boot.cat --grub2-boot-info \
+	    --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img \
+	    -eltorito-alt-boot -e EFI/efiboot.img -no-emul-boot \
+	    -append_partition 2 0xef "$scratch/efiboot.img" \
+	    -output "$top/joyent-debian_live-$release.iso" \
+	    -graft-points "$image" /boot/grub/bios.img="$scratch/bios.img" \
+	    /EFI/efiboot.img="$scratch/efiboot.img"
+
+	    ln -f -s "${top}/joyent-debian_live-$release.iso" "$top/../joyent-debian_live-latest.iso"
+}
+
+# Creates a USB disk that should be bootable with BIOS or UEFI. The partition
+# containing the image is over sized by about 20% for metadata and a bit of
+# breathing room.  Those that want to store more stuff on it can grow the
+# partition and file system to use the available space.
+function create_usb {
+	local skip_sec=2048
+	local bios_start=$skip_sec
+	local bios_sec=2048
+	local bios_end=$(( bios_start + bios_sec - 1 ))
+	local esp_start=$(( bios_end + 1 ))
+	local esp_sec=409600
+	local esp_end=$(( esp_start + esp_sec - 1 ))
+	local esp_mnt=$scratch/mnt/esp
+	local image_start=$(( esp_end + 1 ))
+	local image_sec
+	      image_sec=$(du -sk "$image" | awk '{printf "%0.f\n", $1 * 2 * 1.2}')
+	local image_mnt=$scratch/mnt/image
+	local total_sec=$(( image_start + image_sec ))
+	local disk_mb=$(( total_sec / 2 / 1024 + 1 ))
+	local disk_file=$scratch/joyent-debian_live-$release.usb
+
+	truncate -s "$disk_mb"M "$disk_file"
+
+	parted --script "$disk_file" mklabel gpt \
+	    mkpart primary fat32 ${bios_start}s ${bios_end}s \
+		name 1 BIOS set 1 bios_grub on \
+	    mkpart ESP fat32 ${esp_start}s ${esp_end}s \
+		name 2 EFI set 2 esp on \
+	    mkpart primary fat32 ${image_start}s 100% \
+		name 3 LINUX set 3 msftdata on
+
+	gdisk "$disk_file" <<-EOF
+	r     # recovery and transformation options
+	h     # make hybrid MBR
+	1 2 3 # partition numbers for hybrid MBR
+	N     # do not place EFI GPT (0xEE) partition first in MBR
+	EF    # MBR hex code
+	N     # do not set bootable flag
+	EF    # MBR hex code
+	N     # do not set bootable flag
+	83    # MBR hex code
+	Y     # set the bootable flag
+	x     # extra functionality menu
+	h     # recompute CHS values in protective/hybrid MBR
+	w     # write table to disk and exit
+	Y     # confirm changes
+	EOF
+
+	local parts
+	parts=$(kpartx -s -v -a "$disk_file")
+	cleanup+=("kpartx -d $disk_file")
+
+	esp_dev=$(echo "$parts" | awk -v start=$esp_start \
+	    '$1 == "add" && $NF == start {
+		printf "/dev/mapper/%s", $3;
+		exit 0
+	    }')
+	image_dev=$(echo "$parts" | awk -v start=$image_start \
+	    '$1 == "add" && $NF == start {
+		printf "/dev/mapper/%s", $3;
+		exit 0
+	    }')
+	if [[ -z $esp_dev || -z $image_dev ]]; then
+		echo "$0: failed to find partitions in usb dev" 1>&2
+		exit 1
+	fi
+
+	# Create and mount FAT32 file systems on partitions 2 and 3.  Partition
+	# 1 is not touched.
+	mkdir -p "$esp_mnt" "$image_mnt"
+
+	mkfs.vfat -F32 "$esp_dev"
+	mount "$esp_dev" "$esp_mnt"
+	cleanup+=("onfatal umount $esp_dev")
+
+	mkfs.vfat -F32 "$image_dev"
+	mount "$image_dev" "$image_mnt"
+	cleanup+=("onfatal umount $image_dev")
+
+	grub-install --target=x86_64-efi \
+	    --efi-directory="$esp_mnt" --boot-directory="$image_mnt/boot" \
+	    --removable --recheck
+
+	grub-install --target=i386-pc --boot-directory="$image_mnt/boot" \
+	    --recheck "$disk_file"
+
+	mkdir -p "$image_mnt/boot/grub" "$image_mnt/live"
+	cp -r "$image"/* "$image_mnt"
+	cp "$scratch/grub.cfg" "$image_mnt/boot/grub/grub.cfg"
+
+	umount "$image_mnt"
+	umount "$esp_mnt"
+
+	rm -f "$top/joyent-debian_live-$release.usb.gz"
+	pigz -c "$disk_file" > "$top/joyent-debian_live-$release.usb.gz"
+	ln -f -s "${top}/joyent-debian_live-$release.usb.gz" "$top/../joyent-debian_live-latest.usb.gz"
+
+}
+
+function run {
+	local step=$1
+	local isFirstStep=$2
+	local presnap=$dataset@pre-$step
+	local postsnap=$dataset@post-$step
+	local preSnapExits
+	preSnapExits=$(zfs list -Ho name "$presnap" >/dev/null 2>&1 && echo "yes" || echo "no")
+
+	if [[ $isFirstStep == "yes" && $preSnapExits == "yes" ]]; then
+		zfs rollback -r "$presnap"
+	else
+		# (re)create pre snapshot
+		if [[ $preSnapExits == "yes" ]]; then
+			zfs destroy -f "$presnap"
+		fi
+		zfs snapshot "$presnap"
+	fi
+
+	$step
+
+	# (re)create post snapshot
+	local postSnapExits
+	postSnapExits=$(zfs list -Ho name "$postsnap" >/dev/null 2>&1 && echo "yes" || echo "no")
+	if [[ $postSnapExits == "yes" ]]; then
+		zfs destroy -f "$postsnap"
+	fi
+	zfs snapshot "$postsnap"
+}
+
+function usage {
+	echo "Usage:"
+	echo "    debian-live -h"
+	echo "    debian-live [-m] [-d dataset] [-r release] [step ...]"
+	echo ""
+	echo "  -h  Show this message."
+	echo "  -d  Build within specified dataset."
+	echo "  -m  Install packages that are needed for successful execution."
+	echo "      Without this, preflight_check will provide an error message"
+	echo "      and exit if any required packages are not installed."
+	echo "  -r  Use this release.  Most useful when retrying a failed image"
+	echo "      build after fixing something."
+	echo ""
+	echo "Create a new image from scratch"
+	echo "    debian-live"
+	echo ""
+	echo "Run just the specified steps on an existing image build"
+	echo "    debian-live -r release step [...]"
+	echo ""
+	echo "Valid steps are:"
+	printf "    %s\n" "${all_steps[@]}" ...
+	echo ""
+	echo "Literal ... may be used to specify all remaining steps."
+}
+
+function fail_usage {
+	exec 1>&2
+	usage
+	exit 1
+}
+
+exec </dev/null
+
+release=$(TZ=UTC date +%Y%m%dT%H%M%SZ)
+all_steps=(
+    create_bootstrap
+    install_live
+    install_kernel_packages
+    install_packages
+    install_temporary_packages
+    build_zfs
+    install_lxd
+    install_usr_triton
+    install_usr_triton_helper_scripts
+    install_usr_triton_ur_agent
+    install_usr_triton_cn_agent
+    install_usr_triton_config_agent
+    install_usr_triton_net_agent
+    install_usr_triton_vm_agent
+    install_usr_triton_imgadm
+    install_proto
+    remove_temporary_packages
+    postinstall
+    prepare_archive_bits
+    create_tgz
+    create_iso
+    create_usb
+)
+dataset=
+install_missing=false
+
+while getopts d:hmr:x opt; do
+	case $opt in
+	d)	dataset=$OPTARG ;;
+	h)	usage; exit 0 ;;
+	m)	install_missing=true ;;
+	r)	release=$OPTARG ;;
+	x)	set -x ;;
+	*)	fail_usage ;;
+	esac
+done
+shift $(( OPTIND - 1 ))
+if (( $# == 0 )); then
+	steps=("${all_steps[@]}")
+else
+	steps=()
+	prev=
+	for r_step in "$@"; do
+		if [[ $r_step != ... ]]; then
+			steps+=("$r_step")
+			prev="$r_step"
+			continue
+		fi
+		for f_step in "${all_steps[@]}"; do
+			if [[ $f_step == "$prev" ]]; then
+				prev=_found_it
+				continue
+			fi
+			if [[ $prev == _found_it ]]; then
+				steps+=("$f_step")
+			fi
+		done
+	done
+fi
+
+# Do the preflight_check early to avoid erroring out when trying to use commands
+# like `git` that may not already be installed.
+preflight_check
+
+# If rust was newly installed, we'll need to do this again.
+if [[ -f ~/.cargo/env ]]; then
+	# shellcheck disable=SC1090
+	source ~/.cargo/env
+fi
+
+if [[ -z $dataset ]]; then
+	pools=()
+	for ds in $(zfs list -Ho name -d 1); do
+		case $(basename "$ds") in
+		"$ds")
+			pools+=("$ds")
+			;;
+		debian-live)
+			dataset=$ds
+			break
+			;;
+		*)
+			printf 'Unable to determine dataset!\n'
+			printf 'Error occurred at line %s\n' "$LINENO"
+		esac
+	done
+	if [[ -z $dataset && ${#pools[@]} == 1 ]]; then
+		dataset=${pools[0]}/debian-live
+	fi
+fi
+if [[ -z $dataset ]]; then
+	echo "$0: Unable to determine top-level dataset. Specify with -d" 1>&2
+	exit 1
+fi
+
+dataset=$dataset/$release
+
+if ! zfs list -Ho name "$dataset" >/dev/null 2>&1; then
+	zfs create -p "$dataset"
+fi
+top=$(zfs list -Ho mountpoint "$dataset")
+root=$top/chroot
+image=$top/image
+scratch=$top/scratch
+mkdir -p "$scratch"
+repo=$(git rev-parse --show-toplevel)
+
+motd_alt=$'
+   __        .                   .
+ _|  |_      | .-. .  . .-. :--. |-
+|_    _|     ;|   ||  |(.-\' |  | |
+  |__|   `--\'  `-\' `;-| `-\' \'  \' `-\'
+                   /  ;  Platform ('"$name"' '"$release"$')
+                   `-\'   '"$docurl"'
+'
+
+motd=$'
+            *--+--*--*
+           /| /| /| /|    J O Y E N T
+          / |/ |/ |/ |    #####  ####   #  #####  ###   #   # TM
+         +--*--+--*--*      #    #   #  #    #   #   #  ##  #
+         | /| /| /| /|      #    ####   #    #   #   #  # # #
+         |/ |/ |/ |/ |      #    #  #   #    #   #   #  #  ##
+         *--+--+--+--+      #    #   #  #    #    ###   #   #
+         | /| /| /| /
+         |/ |/ |/ |/       Linux ('"$name"')
+         *--*--+--*         build: '"$release"'
+
+'
+
+: "$motd_alt"
+
+commit=$(cd "$(dirname "$0")" && git rev-parse HEAD)
+product="
+Name: Joyent Platform Image
+Image: $name $release
+Documentation: $docurl
+Description: $name with ZFS $zfs_ver
+Commit: $docurl/commit/$commit
+"
+
+firststep="yes"
+
+for step in "${steps[@]}"; do
+	run "$step" "$firststep"
+	firststep="no"
+done
+
+ln -f -s "$release" "$top/../latest"
+
+clean_exit=true
+set +x
+
+ls -lh "$top/*.iso" "$top/*.usb.gz" "$top/*.tgz" 2>/dev/null || :

@@ -1,0 +1,25 @@
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+
+#
+# Copyright 2020 Joyent, Inc.
+#
+
+#
+# This file is part of the Joyent platform image.  It is intended to configure
+# networking prior to being configured by Triton.
+#
+
+[Match]
+KernelCommandLine=triton.dhcp-all-nics
+
+[Network]
+DHCP=ipv4
+
+[DHCP]
+# Booter (the Triton DHCP server) will only accept DHCP requests that use a
+# specific vendor-class-identifier (must start with "SUNW" or "PXEClient").
+VendorClassIdentifier=PXEClient.Linux.x86_64

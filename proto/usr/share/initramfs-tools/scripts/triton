@@ -1,0 +1,86 @@
+#!/bin/sh
+
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+
+#
+# Copyright 2020 Joyent, Inc.
+#
+
+#
+# This script provides helper functions for setting up Triton.
+#
+
+################################################################################
+# Set up logging.
+# Don't change this unless you absolutely need to. Don't be fancy.
+# It's pretty fragile.
+# Doing the wrong thing here can result in the image being unbootable, or
+# all the scripts failing. Don't rely on anything. At this point in the boot
+# process you're only in the initrd image. Very little of what you expect is
+# available. As noted above, this runs in /bin/sh, which is *dash*. Don't use
+# bashisms. They will not work.
+################################################################################
+set -o xtrace
+
+# All of our live-bottom scripts will log to an ephemeral location on the
+# filesystem. Unfortunately, to have a log history we need persistent storage
+# which means the zpool, but we also need to log bringing up the zpool.
+# If we log to a location on the zpool we can't open the log on the pool before
+# it's mounted. Going through a bunch of extra hoops to make the pool import
+# log to a different location and then move the log to the pool afterward
+# will unnecessarily complicate things. So if we want a log of mounting the pool
+# the log destination can't be either on the pool or somewhere that will be
+# clobbered by mounting the pool.
+# Having the most recent log always available is infinitely more valuable than
+# never having the pool log.
+TRACE_LOG=${rootmnt:=/}/usr/triton/log/boot/$(basename "$0").log
+mkdir -p "$(dirname "$TRACE_LOG")"
+# I'd like to have the date/time stamp in here, but dash doesn't suppor it
+# natively, and my attempt at putting a command in the prompt didn't work
+# initially. Maybe this can be revisted later. Note the fragility as described
+# above.
+PS4=
+PS4="${PS4}"'['"$0"'] LINE:${LINENO}: '
+export PS4
+# Finally, set the file descriptors which will start logging.
+exec 1>>"${TRACE_LOG}"
+exec 2>>"${TRACE_LOG}"
+printf 'Script %s started at %s' "$0" "$(date)"
+################################################################################
+# End extremely fragile portion
+################################################################################
+
+# Make sure we don't get tripped up on these being unset.
+: "${quiet:=false}"
+: "${rootmnt:=/}"
+
+# Setup the config dir.
+#
+# Before `sdc-server setup` there is no /opt directory, so we use an in memory
+# config dir under /usr/triton/config.
+# Once `sdc-server setup` completes, the temporary /usr/triton/config contents
+# will be copied to the persisted /opt/triton/config directory on the zpool,
+# and a symlink is then used to the real persisted directory.
+# All triton tooling/software should use /usr/triton/config/, which should
+# always work regardless of persistence.
+getTritonConfigDir() {
+    zconfig=$(zfs mount | grep '/opt' >/dev/null || echo "not found")
+    triton_config_dir="${rootmnt}/opt/triton/config"
+    usr_triton_config_dir="${rootmnt}/usr/triton/config"
+
+    if [ "${zconfig}" = "not found" ] || [ ! -d "${triton_config_dir}" ]; then
+        # Create a temporary (in memory) /usr/triton/config dir.
+        mkdir -p "${usr_triton_config_dir}"
+        triton_config_dir="${usr_triton_config_dir}"
+    else
+        # Make a symlink for the /usr/triton/config dir.
+        if [ ! -h "$usr_triton_config_dir" ] && [ ! -e "$usr_triton_config_dir" ]; then
+            ln -s "/opt/triton/config" "${usr_triton_config_dir}"
+        fi
+    fi
+
+    echo "${triton_config_dir}"
+}
